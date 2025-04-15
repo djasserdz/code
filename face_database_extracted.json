@@ -1,0 +1,16 @@
+{
+    "people": [
+        {
+            "id": "person_1744751344_2535",
+            "name": "jae",
+            "room": "Room One",
+            "timestamp": "2025-04-15 22:09:04"
+        },
+        {
+            "id": "person_1744751445_7838",
+            "name": "jaze",
+            "room": "Room One",
+            "timestamp": "2025-04-15 22:10:45"
+        }
+    ]
+}
