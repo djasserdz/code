@@ -507,6 +507,35 @@ def recognize_face(embedding, threshold=DEFAULT_THRESHOLD, top_k=3, use_adaptive
         
         return name, match_info
 
+import time
+import norfair
+
+# Tracker configuration
+tracker = norfair.Tracker(distance_function="euclidean", 
+                          min_hits=3, 
+                          max_age=5)
+
+# Global variables for tracking
+tracked_faces = {}
+
+TRACKING_TIMEOUT = 10  # Timeout to remove old tracks (in seconds)
+
+def calculate_iou(box1, box2):
+    """Calculate Intersection over Union (IoU) between two bounding boxes"""
+    x1, y1, w1, h1 = box1
+    x2, y2, w2, h2 = box2
+    inter_x1 = max(x1, x2)
+    inter_y1 = max(y1, y2)
+    inter_x2 = min(x1 + w1, x2 + w2)
+    inter_y2 = min(y1 + h1, y2 + h2)
+    
+    inter_area = max(0, inter_x2 - inter_x1) * max(0, inter_y2 - inter_y1)
+    area1 = w1 * h1
+    area2 = w2 * h2
+    
+    iou = inter_area / (area1 + area2 - inter_area)
+    return iou
+
 def track_faces(frame, detected_boxes, recognized_faces=None):
     """Track faces across frames for consistent recognition
     
@@ -518,77 +547,56 @@ def track_faces(frame, detected_boxes, recognized_faces=None):
     Returns:
         dict: Updated tracking information
     """
-    global next_track_id, tracked_faces
+    global tracked_faces, tracker
     current_time = time.time()
-    
-    # Clean up old tracks
-    to_remove = []
-    for track_id, track_info in tracked_faces.items():
-        if current_time - track_info["last_seen"] > TRACKING_TIMEOUT:
-            to_remove.append(track_id)
-    for track_id in to_remove:
-        del tracked_faces[track_id]
-        
-    # Match current detections with existing tracks
-    if detected_boxes is not None and len(detected_boxes) > 0:
-        # For each detection, try to match with existing tracks
-        unmatched_detections = []
-        matched_track_ids = []
-        
-        for i, box in enumerate(detected_boxes):
-            box_coords = box[:4]
-            matched = False
-            best_iou = 0.3  # Minimum IoU to consider a match
-            matched_id = None
-            
-            # Try to match with existing tracks
-            for track_id, track_info in tracked_faces.items():
-                iou = calculate_iou(box_coords, track_info["box"])
-                if iou > best_iou:
-                    best_iou = iou
-                    matched_id = track_id
-                    matched = True
-            
-            if matched:
-                # Update existing track
-                matched_track_ids.append(matched_id)
-                tracked_faces[matched_id]["box"] = box_coords
-                tracked_faces[matched_id]["confidence"] = box[4] if len(box) > 4 else 1.0
-                tracked_faces[matched_id]["last_seen"] = current_time
-                
-                # If we have recognition info, update it
-                if recognized_faces and i < len(recognized_faces):
-                    name, info = recognized_faces[i]
-                    if name and name != "Unknown":
-                        tracked_faces[matched_id]["name"] = name
-                        tracked_faces[matched_id]["info"] = info
-            else:
-                unmatched_detections.append((i, box))
-                
-        # Create new tracks for unmatched detections
-        for idx, box in unmatched_detections:
-            track_id = next_track_id
-            next_track_id += 1
-            
-            # Initial track info
-            track_info = {
-                "box": box[:4],
-                "confidence": box[4] if len(box) > 4 else 1.0,
+
+    # Prepare detections in the format Norfair expects (list of Points)
+    detections = []
+    for box in detected_boxes:
+        x1, y1, w, h = box[:4]
+        # Norfair expects detections as (x, y, width, height)
+        detections.append(norfair.Observation(np.array([x1 + w / 2, y1 + h / 2])))
+
+    # Update tracker with new detections
+    tracked_objects = tracker.update(detections)
+
+    # Process tracked faces
+    for obj in tracked_objects:
+        track_id = obj.id
+
+        if track_id not in tracked_faces:
+            # Create a new track
+            tracked_faces[track_id] = {
+                "box": detected_boxes[obj.index][:4],  # Store the box
+                "confidence": detected_boxes[obj.index][4] if len(detected_boxes[obj.index]) > 4 else 1.0,
                 "first_seen": current_time,
                 "last_seen": current_time,
                 "frames_tracked": 1,
                 "name": "Unknown",
                 "info": None
             }
-            
-            # If we have recognition info, use it
-            if recognized_faces and idx < len(recognized_faces):
-                name, info = recognized_faces[idx]
-                if name and name != "Unknown":
-                    track_info["name"] = name
-                    track_info["info"] = info
-                    
-            tracked_faces[track_id] = track_info
+
+        # Update tracked face details
+        tracked_faces[track_id]["box"] = detected_boxes[obj.index][:4]
+        tracked_faces[track_id]["confidence"] = detected_boxes[obj.index][4] if len(detected_boxes[obj.index]) > 4 else 1.0
+        tracked_faces[track_id]["last_seen"] = current_time
+        tracked_faces[track_id]["frames_tracked"] += 1
+
+        # If we have recognition info, update it
+        if recognized_faces and obj.index < len(recognized_faces):
+            name, info = recognized_faces[obj.index]
+            if name and name != "Unknown":
+                tracked_faces[track_id]["name"] = name
+                tracked_faces[track_id]["info"] = info
+
+    # Clean up old tracks
+    to_remove = []
+    for track_id, track_info in tracked_faces.items():
+        if current_time - track_info["last_seen"] > TRACKING_TIMEOUT:
+            to_remove.append(track_id)
+
+    for track_id in to_remove:
+        del tracked_faces[track_id]
     
     return tracked_faces
 
