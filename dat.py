@@ -5,6 +5,7 @@ os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
 import cv2
 import torch
+import pickle
 import numpy as np
 import time
 import threading
@@ -12,7 +13,7 @@ import queue
 from ultralytics import YOLO
 from facenet_pytorch import InceptionResnetV1
 from data import (
-    load_database, save_database, recognize_face, add_person,  DEFAULT_THRESHOLD,update_person
+    load_database, save_database, recognize_face, add_person,  DEFAULT_THRESHOLD,update_person, enhance_face_for_recognition, track_faces
 )
 
 # Device configuration
@@ -118,10 +119,8 @@ class FaceProcessor(threading.Thread):
 
                                 face = img[y1_m:y2_m, x1_m:x2_m]
                                 if face.shape[0] > 0 and face.shape[1] > 0:
-                                    # Enhance face image using histogram equalization
-                                    face_yuv = cv2.cvtColor(face, cv2.COLOR_BGR2YUV)
-                                    face_yuv[:, :, 0] = cv2.equalizeHist(face_yuv[:, :, 0])
-                                    face = cv2.cvtColor(face_yuv, cv2.COLOR_YUV2BGR)
+                                    # Enhance face image for better recognition
+                                    face = enhance_face_for_recognition(face)
                                     
                                     # Resize to FaceNet input size
                                     face = cv2.resize(face, (160, 160))
@@ -150,10 +149,12 @@ class FaceProcessor(threading.Thread):
 
                             current_results = []
                             self.pending_unknown_faces = []
+                            recognized_faces = []
 
                             # Match embeddings with database
                             for box, emb in zip(valid_boxes, embeddings):
-                                name, info = recognize_face(emb, threshold=self.face_detection_threshold, top_k=3)
+                                # Use improved recognition with adaptive thresholding
+                                name, info = recognize_face(emb, threshold=self.face_detection_threshold, top_k=3, use_adaptive_threshold=True)
                                 x1 = int(box[0])
                                 room = "Room One" if x1 < img.shape[1] // 2 else "Room Two"
 
@@ -164,8 +165,16 @@ class FaceProcessor(threading.Thread):
                                     person_id = info.get("person_id")
                                     if info.get("confidence", 0) > 0.8 and info.get("room") != room:
                                         update_person(person_id, room=room)
-
+                                
+                                recognized_faces.append((name, info))
                                 current_results.append((box, name, room, info))
+                            
+                            # Apply tracking for consistent face recognition
+                            tracked_results = track_faces(img, valid_boxes, recognized_faces)
+                            
+                            # Update results with tracking information if needed
+                            # This section can be expanded to utilize the tracking data
+                            
                             self.results = current_results
 
                         except Exception as e:
@@ -224,6 +233,7 @@ def main():
     cap.set(cv2.CAP_PROP_FPS, 30)  # Request 30fps if possible
     
     prev_time = 0
+
     show_help = True
     global DEBUG
     
@@ -237,6 +247,7 @@ def main():
     unknown_room = None
     name_input = ""
     input_active = False
+    auto_dismiss_timer = 0  # Timer to auto-dismiss the popup if no action is taken
     
     # Text prompt position
     prompt_x = 20
@@ -266,6 +277,7 @@ def main():
                 current_unknown_idx = 0
                 name_input = ""
                 input_active = False
+                auto_dismiss_timer = time.time()  # Start the auto-dismiss timer
             
             # Draw recognition results
             if DEBUG:
@@ -321,37 +333,72 @@ def main():
                 cv2.rectangle(frame, (x1, y1 - label_height - 10), (x1 + label_width, y1), text_bg_color, -1)
                 cv2.putText(frame, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-            # Show "Add Person?" UI
+            # Show "Add Person?" UI - improved version
             if show_add_person:
+                # Check if we should auto-dismiss after 10 seconds of no interaction
+                if time.time() - auto_dismiss_timer > 10 and not input_active:
+                    show_add_person = False
+                    if processor.pending_unknown_faces:
+                        processor.pending_unknown_faces.pop(0)
+                    continue
+                
                 # Highlight the unknown face we're asking about
                 if unknown_box and len(unknown_box) == 4:
                     x1, y1, x2, y2 = unknown_box
-                    # Draw special highlight box
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 165, 255), 3)  # Orange box
-                
-                # Draw the prompt
-                cv2.rectangle(frame, (prompt_x - 10, prompt_y - 30), (prompt_x + 300, prompt_y + 60), (45, 45, 45), -1)
-                cv2.putText(frame, f"Add unknown face in {unknown_room}?", (prompt_x, prompt_y), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                
-                # Buttons
-                cv2.rectangle(frame, (prompt_x, prompt_y + 10), (prompt_x + 40, prompt_y + 40), (0, 0, 255), 2)
-                cv2.putText(frame, "No", (prompt_x + 10, prompt_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                
-                cv2.rectangle(frame, (prompt_x + 60, prompt_y + 10), (prompt_x + 100, prompt_y + 40), (0, 255, 0), 2)
-                cv2.putText(frame, "Yes", (prompt_x + 65, prompt_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
-                # New button for registering face
-                cv2.rectangle(frame, (prompt_x + 120, prompt_y + 10), (prompt_x + 200, prompt_y + 40), (255, 255, 0), 2)
-                cv2.putText(frame, "Register", (prompt_x + 125, prompt_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-                
-                # If Yes is selected, show name input
-                if input_active:
-                    cv2.rectangle(frame, (prompt_x, prompt_y + 45), (prompt_x + 280, prompt_y + 75), (70, 70, 70), -1)
-                    cv2.putText(frame, f"Name: {name_input}_", (prompt_x + 5, prompt_y + 65), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-                    cv2.putText(frame, "Enter: confirm | Esc: cancel", (prompt_x + 5, prompt_y + 85), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+                    face_width = x2 - x1
+                    face_height = y2 - y1
+                    
+                    # Create a darker semi-transparent overlay for the face highlight
+                    overlay = frame.copy()
+                    cv2.rectangle(overlay, (x1-5, y1-5), (x2+5, y2+5), (0, 165, 255), -1)  # Filled orange
+                    cv2.addWeighted(overlay, 0.3, frame, 0.7, 0, frame)  # Apply with 30% opacity
+                    
+                    # Draw a more prominent outline
+                    cv2.rectangle(frame, (x1-5, y1-5), (x2+5, y2+5), (0, 165, 255), 2)
+                    
+                    # Position the UI above the face if there's space, otherwise below
+                    ui_height = 100 if input_active else 55
+                    if y1 > ui_height + 10:  # If there's enough space above the face
+                        ui_y = y1 - ui_height - 10
+                    else:  # Place below the face
+                        ui_y = y2 + 10
+                    
+                    # Position UI centered on the face
+                    ui_width = max(220, face_width + 40)
+                    ui_x = max(5, x1 - (ui_width - face_width) // 2)
+                    
+                    # Make sure UI doesn't go off-screen
+                    if ui_x + ui_width > frame.shape[1] - 5:
+                        ui_x = frame.shape[1] - ui_width - 5
+                    
+                    # Draw UI background with rounded corners
+                    # Since OpenCV doesn't support rounded corners directly, we'll use an overlay
+                    ui_overlay = frame.copy()
+                    cv2.rectangle(ui_overlay, (ui_x, ui_y), (ui_x + ui_width, ui_y + ui_height), (40, 40, 45), -1)
+                    cv2.addWeighted(ui_overlay, 0.8, frame, 0.2, 0, frame)
+                    
+                    # Add prompt text
+                    prompt_text = f"Unknown face in {unknown_room}"
+                    cv2.putText(frame, prompt_text, (ui_x + 10, ui_y + 20), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    
+                    # Add action text
+                    cv2.putText(frame, "Add to database? [Y/N]", (ui_x + 10, ui_y + 40), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                    
+                    # If name input is active, show input field
+                    if input_active:
+                        # Input field background
+                        cv2.rectangle(frame, (ui_x + 10, ui_y + 50), (ui_x + ui_width - 10, ui_y + 80), (60, 60, 65), -1)
+                        
+                        # Show name input with blinking cursor
+                        cursor = "_" if int(time.time() * 2) % 2 == 0 else " "
+                        cv2.putText(frame, f"Name: {name_input}{cursor}", (ui_x + 15, ui_y + 70), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                        
+                        # Show instructions
+                        cv2.putText(frame, "Enter: confirm | Esc: cancel", (ui_x + 15, ui_y + 95), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1)
 
             # Display FPS
             curr_time = time.time()
@@ -361,7 +408,7 @@ def main():
 
             # Show instructions
             if show_help:
-                help_text = "Press Q to Quit | D to Toggle Debug | S to Save | H to Toggle Help"
+                help_text = "Press 1 to Quit | 2 to Toggle Debug | 3 to Save | 4 to Toggle Help"
                 cv2.putText(frame, help_text, (10, frame.shape[0] - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
@@ -370,38 +417,28 @@ def main():
 
             # Handle key presses
             key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
+            if key == ord('1'):
                 break
-            elif key == ord('d'):
+            elif key == ord('2'):
                 DEBUG = not DEBUG
                 print(f"DEBUG mode set to {DEBUG}")
-            elif key == ord('s'):
+            elif key == ord('3'):
                 save_database()
                 print("Database saved.")
-            elif key == ord('h'):
+            elif key == ord('4'):
                 show_help = not show_help
             elif show_add_person:
                 if key == ord('y') or key == ord('Y'):
                     input_active = True
+                    auto_dismiss_timer = time.time()  # Reset timer when user interacts
                 elif key == ord('n') or key == ord('N'):
                     show_add_person = False
                     input_active = False
                     # Go to next unknown face if there are more
                     if processor.pending_unknown_faces:
                         processor.pending_unknown_faces.pop(0)
-                elif key == ord('r') or key == ord('R'):
-                    # Register the new face
-                    if name_input:
-                        register_new_face(name_input, unknown_embedding, unknown_room)
-                        
-                        # Reset UI state
-                        show_add_person = False
-                        input_active = False
-                        
-                        # Remove from pending list
-                        if processor.pending_unknown_faces:
-                            processor.pending_unknown_faces.pop(0)
                 elif input_active:
+                    auto_dismiss_timer = time.time()  # Reset timer when user types
                     if key == 27:  # ESC key
                         input_active = False
                         show_add_person = False
